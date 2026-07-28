@@ -263,6 +263,12 @@ bool createDirRecursively(const char* dir) {
 		}
 		*next = '\0';
 
+		if (strcmp(curr, ".") == 0 || strcmp(curr, "..") == 0) {
+			LOG_W("Unsafe path component %s in '%s'", QC(curr), dir);
+			close(prev_dir_fd);
+			return false;
+		}
+
 		if (mkdirat(prev_dir_fd, curr, 0755) == -1 && errno != EEXIST) {
 			if (errno != EROFS || !util::existsAsDirAt(prev_dir_fd, curr)) {
 				PLOG_W("mkdir(%s, 0755)", QC(curr));
@@ -271,9 +277,11 @@ bool createDirRecursively(const char* dir) {
 			}
 		}
 
-		int dir_fd = TEMP_FAILURE_RETRY(openat(prev_dir_fd, curr, O_DIRECTORY | O_CLOEXEC));
+		int dir_fd = TEMP_FAILURE_RETRY(
+		    openat(prev_dir_fd, curr, O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW));
 		if (dir_fd == -1) {
-			PLOG_W("openat('%d', %s, O_DIRECTORY | O_CLOEXEC)", prev_dir_fd, QC(curr));
+			PLOG_W("openat('%d', %s, O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW)", prev_dir_fd,
+			    QC(curr));
 			close(prev_dir_fd);
 			return false;
 		}

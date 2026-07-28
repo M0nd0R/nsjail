@@ -183,41 +183,133 @@ static bool remountWithLegacyMount(const mount_t& mpt) {
 	return true;
 }
 
-static bool openMountForRemount(mount_t* mpt, int root_fd, const char* rel_dst) {
+static bool openMountForRemount(mount_t* mpt, int parent_fd, const char* leaf) {
 	mpt->fd = util::syscall(
-	    __NR_open_tree, (uintptr_t)root_fd, (uintptr_t)rel_dst, (uintptr_t)OPEN_TREE_CLOEXEC);
+	    __NR_open_tree, (uintptr_t)parent_fd, (uintptr_t)leaf, (uintptr_t)OPEN_TREE_CLOEXEC);
 	if (mpt->fd < 0) {
-		PLOG_W("open_tree(root_fd, '%s')", rel_dst);
+		PLOG_W("open_tree(parent_fd, '%s')", leaf);
 		return false;
 	}
 	mpt->mounted = true;
 	return true;
 }
 
+/*
+ * Create directories under root_fd without following intermediate symlinks.
+ * Multi-component mkdirat() would follow symlinks and escape the staging root.
+ */
 static bool createDirAt(int dir_fd, const char* path, mode_t mode) {
 	path = util::stripLeadingSlashes(path);
 	if (!path[0]) {
 		return true;
 	}
 
-	std::string cumulative;
+	int cur_fd = dir_fd;
+	bool own_cur = false;
+	defer {
+		if (own_cur) {
+			close(cur_fd);
+		}
+	};
+
 	for (const auto& component : util::strSplit(path, '/')) {
-		if (component.empty()) {
+		if (component.empty() || component == ".") {
 			continue;
 		}
-
-		if (!cumulative.empty()) {
-			cumulative += '/';
+		if (component == "..") {
+			LOG_W("Rejecting '..' in mount destination path '%s'", path);
+			return false;
 		}
-		cumulative += component;
 
-		if (mkdirat(dir_fd, cumulative.c_str(), mode) == -1 && errno != EEXIST) {
-			if (errno != EROFS || !util::existsAsDirAt(dir_fd, cumulative.c_str())) {
-				PLOG_W("mkdirat(%d, '%s')", dir_fd, cumulative.c_str());
+		if (mkdirat(cur_fd, component.c_str(), mode) == -1 && errno != EEXIST) {
+			if (errno != EROFS || !util::existsAsDirAt(cur_fd, component.c_str())) {
+				PLOG_W("mkdirat(%d, '%s')", cur_fd, component.c_str());
 				return false;
 			}
 		}
+
+		int next_fd = TEMP_FAILURE_RETRY(
+		    openat(cur_fd, component.c_str(), O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW));
+		if (next_fd < 0) {
+			PLOG_W("openat(%d, '%s', O_DIRECTORY|O_NOFOLLOW)", cur_fd, component.c_str());
+			return false;
+		}
+		if (own_cur) {
+			close(cur_fd);
+		}
+		cur_fd = next_fd;
+		own_cur = true;
 	}
+	return true;
+}
+
+/*
+ * Resolve the parent directory fd (O_NOFOLLOW walk) and leaf basename for a
+ * relative path under root_fd. Caller must close *parent_fd if *own_parent.
+ */
+static bool resolveParentAt(int root_fd, const char* rel_path, int* parent_fd, bool* own_parent,
+    std::string* leaf) {
+	*own_parent = false;
+	*parent_fd = root_fd;
+	leaf->clear();
+
+	rel_path = util::stripLeadingSlashes(rel_path);
+	if (!rel_path[0] || strcmp(rel_path, ".") == 0) {
+		*leaf = ".";
+		return true;
+	}
+
+	const char* last_slash = strrchr(rel_path, '/');
+	if (!last_slash) {
+		if (strcmp(rel_path, "..") == 0) {
+			LOG_W("Rejecting '..' as mount destination leaf");
+			return false;
+		}
+		*leaf = rel_path;
+		return true;
+	}
+
+	std::string parent(rel_path, last_slash - rel_path);
+	*leaf = last_slash + 1;
+	if (leaf->empty() || *leaf == "." || *leaf == "..") {
+		LOG_W("Rejecting empty/'.'/'..' leaf in mount destination '%s'", rel_path);
+		return false;
+	}
+
+	if (!createDirAt(root_fd, parent.c_str(), 0755)) {
+		return false;
+	}
+
+	/* Re-walk parent with O_NOFOLLOW to obtain the fd. */
+	int cur_fd = root_fd;
+	bool own_cur = false;
+	for (const auto& component : util::strSplit(parent, '/')) {
+		if (component.empty() || component == ".") {
+			continue;
+		}
+		if (component == "..") {
+			if (own_cur) {
+				close(cur_fd);
+			}
+			return false;
+		}
+		int next_fd = TEMP_FAILURE_RETRY(
+		    openat(cur_fd, component.c_str(), O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW));
+		if (next_fd < 0) {
+			PLOG_W("openat(%d, '%s', O_DIRECTORY|O_NOFOLLOW)", cur_fd, component.c_str());
+			if (own_cur) {
+				close(cur_fd);
+			}
+			return false;
+		}
+		if (own_cur) {
+			close(cur_fd);
+		}
+		cur_fd = next_fd;
+		own_cur = true;
+	}
+	*parent_fd = cur_fd;
+	*own_parent = own_cur;
 	return true;
 }
 
@@ -312,26 +404,26 @@ static int createFilesystemMount(const mount_t& mpt) {
 	return mnt_fd;
 }
 
-static bool mountSymlinkAt(mount_t* mpt, int root_fd, const char* rel_dst) {
-	LOG_D("Creating symlink: %s -> %s (fd-relative)", mpt->src.c_str(), rel_dst);
-	if (symlinkat(mpt->src.c_str(), root_fd, rel_dst) == -1) {
+static bool mountSymlinkAt(mount_t* mpt, int parent_fd, const char* leaf) {
+	LOG_D("Creating symlink: %s -> %s (fd-relative)", mpt->src.c_str(), leaf);
+	if (symlinkat(mpt->src.c_str(), parent_fd, leaf) == -1) {
 		if (mpt->mpt->mandatory()) {
-			PLOG_E("symlinkat('%s' -> '%s')", mpt->src.c_str(), rel_dst);
+			PLOG_E("symlinkat('%s' -> '%s')", mpt->src.c_str(), leaf);
 			return false;
 		}
-		PLOG_W("symlinkat('%s' -> '%s') failed (non-mandatory)", mpt->src.c_str(), rel_dst);
+		PLOG_W("symlinkat('%s' -> '%s') failed (non-mandatory)", mpt->src.c_str(), leaf);
 	}
 	return true;
 }
 
-static bool mountDynamicContentAt(mount_t* mpt, int root_fd, const char* rel_dst) {
+static bool mountDynamicContentAt(mount_t* mpt, int parent_fd, const char* leaf) {
 	static uint64_t counter = 0;
 	std::string src_rel = ".dyn." + std::to_string(++counter);
 
 	int src_fd =
-	    openat(root_fd, src_rel.c_str(), O_CREAT | O_EXCL | O_WRONLY | O_CLOEXEC, 0644);
+	    openat(parent_fd, src_rel.c_str(), O_CREAT | O_EXCL | O_WRONLY | O_CLOEXEC, 0644);
 	if (src_fd < 0) {
-		PLOG_W("openat(root_fd, '%s', O_CREAT)", src_rel.c_str());
+		PLOG_W("openat(parent_fd, '%s', O_CREAT)", src_rel.c_str());
 		return false;
 	}
 
@@ -339,47 +431,46 @@ static bool mountDynamicContentAt(mount_t* mpt, int root_fd, const char* rel_dst
 	bool ok = util::writeToFd(src_fd, content.data(), content.length());
 	close(src_fd);
 	if (!ok) {
-		LOG_W("Failed to write %zu bytes for dynamic content '%s'", content.length(),
-		    rel_dst);
-		unlinkat(root_fd, src_rel.c_str(), 0);
+		LOG_W("Failed to write %zu bytes for dynamic content '%s'", content.length(), leaf);
+		unlinkat(parent_fd, src_rel.c_str(), 0);
 		return false;
 	}
 
-	int mnt_fd =
-	    syscall(__NR_open_tree, root_fd, src_rel.c_str(), OPEN_TREE_CLONE | OPEN_TREE_CLOEXEC);
+	int mnt_fd = syscall(
+	    __NR_open_tree, parent_fd, src_rel.c_str(), OPEN_TREE_CLONE | OPEN_TREE_CLOEXEC);
 	if (mnt_fd < 0) {
 		PLOG_W("open_tree('%s')", src_rel.c_str());
-		unlinkat(root_fd, src_rel.c_str(), 0);
+		unlinkat(parent_fd, src_rel.c_str(), 0);
 		return false;
 	}
 
 	if (!applyMountFlags(mnt_fd, mpt->flags & ~MS_RDONLY)) {
-		LOG_W("Failed to apply mount flags to '%s'", rel_dst);
+		LOG_W("Failed to apply mount flags to '%s'", leaf);
 	}
 
-	if (util::syscall(__NR_move_mount, (uintptr_t)mnt_fd, (uintptr_t)"", (uintptr_t)root_fd,
-		(uintptr_t)rel_dst, (uintptr_t)MOVE_MOUNT_F_EMPTY_PATH) < 0) {
-		PLOG_W("move_mount('%s' -> '%s')", src_rel.c_str(), rel_dst);
+	if (util::syscall(__NR_move_mount, (uintptr_t)mnt_fd, (uintptr_t)"", (uintptr_t)parent_fd,
+		(uintptr_t)leaf, (uintptr_t)MOVE_MOUNT_F_EMPTY_PATH) < 0) {
+		PLOG_W("move_mount('%s' -> '%s')", src_rel.c_str(), leaf);
 		close(mnt_fd);
-		unlinkat(root_fd, src_rel.c_str(), 0);
+		unlinkat(parent_fd, src_rel.c_str(), 0);
 		return false;
 	}
 	close(mnt_fd);
 
-	if (unlinkat(root_fd, src_rel.c_str(), 0) == -1) {
-		PLOG_W("unlinkat(root_fd, '%s')", src_rel.c_str());
+	if (unlinkat(parent_fd, src_rel.c_str(), 0) == -1) {
+		PLOG_W("unlinkat(parent_fd, '%s')", src_rel.c_str());
 	}
 
-	mpt->fd = syscall(__NR_open_tree, root_fd, rel_dst, (unsigned int)OPEN_TREE_CLOEXEC);
+	mpt->fd = syscall(__NR_open_tree, parent_fd, leaf, (unsigned int)OPEN_TREE_CLOEXEC);
 	if (mpt->fd < 0) {
-		PLOG_W("open_tree(root_fd, '%s')", rel_dst);
+		PLOG_W("open_tree(parent_fd, '%s')", leaf);
 		return false;
 	}
 	mpt->mounted = true;
 	return true;
 }
 
-static bool doBindMountAt(mount_t* mpt, int root_fd, const char* rel_dst) {
+static bool doBindMountAt(mount_t* mpt, int parent_fd, const char* leaf) {
 	unsigned int flags = OPEN_TREE_CLONE | OPEN_TREE_CLOEXEC;
 	if (mpt->flags & MS_REC) {
 		flags |= AT_RECURSIVE;
@@ -394,18 +485,18 @@ static bool doBindMountAt(mount_t* mpt, int root_fd, const char* rel_dst) {
 
 	/* Apply non-RO flags now; RO applied later via remount */
 	if (!applyMountFlags(mnt_fd, mpt->flags & ~MS_RDONLY)) {
-		LOG_W("Failed to apply mount flags to '%s'", rel_dst);
+		LOG_W("Failed to apply mount flags to '%s'", leaf);
 	}
 
-	if (util::syscall(__NR_move_mount, (uintptr_t)mnt_fd, (uintptr_t)"", (uintptr_t)root_fd,
-		(uintptr_t)rel_dst, (uintptr_t)MOVE_MOUNT_F_EMPTY_PATH) < 0) {
-		PLOG_W("move_mount('%s' -> '%s')", mpt->src.c_str(), rel_dst);
+	if (util::syscall(__NR_move_mount, (uintptr_t)mnt_fd, (uintptr_t)"", (uintptr_t)parent_fd,
+		(uintptr_t)leaf, (uintptr_t)MOVE_MOUNT_F_EMPTY_PATH) < 0) {
+		PLOG_W("move_mount('%s' -> '%s')", mpt->src.c_str(), leaf);
 		close(mnt_fd);
 		return false;
 	}
 	close(mnt_fd);
 
-	return openMountForRemount(mpt, root_fd, rel_dst);
+	return openMountForRemount(mpt, parent_fd, leaf);
 }
 
 static bool mountSinglePointAt(mount_t* mpt, int root_fd) {
@@ -416,41 +507,45 @@ static bool mountSinglePointAt(mount_t* mpt, int root_fd) {
 		rel_dst = ".";
 	}
 
-	const char* last_slash = strrchr(rel_dst, '/');
-	if (last_slash && last_slash != rel_dst) {
-		std::string parent(rel_dst, last_slash - rel_dst);
-		if (!createDirAt(root_fd, parent.c_str(), 0755)) {
-			LOG_W("Failed to create parent directories for '%s'", rel_dst);
-			return false;
-		}
+	int parent_fd = root_fd;
+	bool own_parent = false;
+	std::string leaf;
+	if (!resolveParentAt(root_fd, rel_dst, &parent_fd, &own_parent, &leaf)) {
+		LOG_W("Failed to resolve parent for '%s'", rel_dst);
+		return false;
 	}
+	defer {
+		if (own_parent) {
+			close(parent_fd);
+		}
+	};
 
 	if (mpt->mpt->is_symlink()) {
-		return mountSymlinkAt(mpt, root_fd, rel_dst);
+		return mountSymlinkAt(mpt, parent_fd, leaf.c_str());
 	}
 
 	if (mpt->is_dir) {
-		if (strcmp(rel_dst, ".") != 0 && mkdirat(root_fd, rel_dst, 0711) == -1 &&
-		    errno != EEXIST) {
-			if (errno != EROFS || !util::existsAsDirAt(root_fd, rel_dst)) {
-				PLOG_W("mkdirat(root_fd, '%s')", rel_dst);
+		if (leaf != "." && mkdirat(parent_fd, leaf.c_str(), 0711) == -1 && errno != EEXIST) {
+			if (errno != EROFS || !util::existsAsDirAt(parent_fd, leaf.c_str())) {
+				PLOG_W("mkdirat(parent_fd, '%s')", leaf.c_str());
 			}
 		}
 	} else {
-		int fd = openat(root_fd, rel_dst, O_CREAT | O_RDONLY | O_CLOEXEC, 0644);
+		int fd = openat(parent_fd, leaf.c_str(), O_CREAT | O_RDONLY | O_CLOEXEC | O_NOFOLLOW,
+		    0644);
 		if (fd >= 0) {
 			close(fd);
-		} else if (errno != EROFS || !util::existsAsRegAt(root_fd, rel_dst)) {
-			PLOG_W("openat(root_fd, '%s', O_CREAT)", rel_dst);
+		} else if (errno != EROFS || !util::existsAsRegAt(parent_fd, leaf.c_str())) {
+			PLOG_W("openat(parent_fd, '%s', O_CREAT)", leaf.c_str());
 		}
 	}
 
 	if (!mpt->mpt->src_content().empty()) {
-		return mountDynamicContentAt(mpt, root_fd, rel_dst);
+		return mountDynamicContentAt(mpt, parent_fd, leaf.c_str());
 	}
 
 	if (mpt->flags & MS_BIND) {
-		return doBindMountAt(mpt, root_fd, rel_dst);
+		return doBindMountAt(mpt, parent_fd, leaf.c_str());
 	}
 
 	int mnt_fd = createFilesystemMount(*mpt);
@@ -459,18 +554,18 @@ static bool mountSinglePointAt(mount_t* mpt, int root_fd) {
 	}
 
 	if (!applyMountFlags(mnt_fd, mpt->flags & ~MS_RDONLY)) {
-		LOG_W("Failed to apply mount flags to '%s'", rel_dst);
+		LOG_W("Failed to apply mount flags to '%s'", leaf.c_str());
 	}
 
-	if (util::syscall(__NR_move_mount, (uintptr_t)mnt_fd, (uintptr_t)"", (uintptr_t)root_fd,
-		(uintptr_t)rel_dst, (uintptr_t)MOVE_MOUNT_F_EMPTY_PATH) < 0) {
-		PLOG_W("move_mount() for '%s'", rel_dst);
+	if (util::syscall(__NR_move_mount, (uintptr_t)mnt_fd, (uintptr_t)"", (uintptr_t)parent_fd,
+		(uintptr_t)leaf.c_str(), (uintptr_t)MOVE_MOUNT_F_EMPTY_PATH) < 0) {
+		PLOG_W("move_mount() for '%s'", leaf.c_str());
 		close(mnt_fd);
 		return false;
 	}
 	close(mnt_fd);
 
-	return openMountForRemount(mpt, root_fd, rel_dst);
+	return openMountForRemount(mpt, parent_fd, leaf.c_str());
 }
 
 static mount_t prepareMountPoint(const nsjail::MountPt& proto) {
